@@ -1,0 +1,231 @@
+
+#!/usr/bin/env python3
+import time
+import cv2
+import numpy as np
+import rospy
+import onnxruntime as ort
+
+from sensor_msgs.msg import Image
+from std_srvs.srv import Trigger, SetBool
+
+MODEL_PATH = (
+    "/home/hiwonder/pug/src/pug_alif/"
+    "shoe_detection/shoe_yolov8n_single.onnx"
+)
+CAMERA_TOPIC = "/csi_camera/image_rect_color"
+
+IMG_SIZE = 416
+CONF_THRESHOLD = 0.70
+INFERENCE_INTERVAL = 0.5
+NMS_THRESHOLD = 0.45
+REQUIRED_SHOE_FRAMES = 5
+
+
+class ShoeCameraTestSingle:
+    def __init__(self):
+        rospy.init_node("shoe_camera_test_single", anonymous=False)
+
+        self.last_inference = 0.0
+        self.frame_count = 0
+        self.consecutive_shoe_frames = 0
+        self.face_mode_triggered = False
+
+        self.session = ort.InferenceSession(
+            MODEL_PATH,
+            providers=["CPUExecutionProvider"]
+        )
+        self.input_name = self.session.get_inputs()[0].name
+
+        rospy.loginfo("Single-class YOLO shoe model loaded")
+        rospy.loginfo("Model: %s", MODEL_PATH)
+        rospy.loginfo("Subscribing to %s", CAMERA_TOPIC)
+
+        self.sub = rospy.Subscriber(
+            CAMERA_TOPIC,
+            Image,
+            self.image_callback,
+            queue_size=1,
+            buff_size=2**24
+        )
+
+    def trigger_face_detection(self):
+        if self.face_mode_triggered:
+            return
+
+        try:
+            rospy.loginfo("Shoe detected for 5 consecutive frames")
+
+            rospy.wait_for_service(
+                "/face_detect/enter", timeout=5.0
+            )
+            rospy.wait_for_service(
+                "/face_detect/set_running", timeout=5.0
+            )
+
+            enter_face = rospy.ServiceProxy(
+                "/face_detect/enter", Trigger
+            )
+            set_running = rospy.ServiceProxy(
+                "/face_detect/set_running", SetBool
+            )
+
+            enter_response = enter_face()
+            rospy.loginfo(
+                "Enter response: success=%s, message=%s",
+                enter_response.success,
+                enter_response.message
+            )
+
+            if not enter_response.success:
+                rospy.logerr("Face detection enter service failed")
+                return
+
+            running_response = set_running(True)
+            rospy.loginfo(
+                "Set running response: success=%s, message=%s",
+                running_response.success,
+                running_response.message
+            )
+
+            if running_response.success:
+                self.face_mode_triggered = True
+                rospy.loginfo("Face detection activated")
+            else:
+                rospy.logerr("Could not activate face detection")
+
+        except Exception as exc:
+            rospy.logerr("Face detection trigger failed: %s", str(exc))
+
+    def image_callback(self, msg):
+        now = time.time()
+        if now - self.last_inference < INFERENCE_INTERVAL:
+            return
+
+        self.last_inference = now
+        self.frame_count += 1
+
+        try:
+            if msg.encoding != "rgb8":
+                rospy.logerr_throttle(
+                    5.0,
+                    "Expected rgb8 image, received %s",
+                    msg.encoding
+                )
+                return
+
+            frame_rgb = np.frombuffer(
+                msg.data, dtype=np.uint8
+            ).reshape(
+                msg.height, msg.step // 3, 3
+            )[:, :msg.width, :]
+
+            frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            height, width = frame.shape[:2]
+
+            resized = cv2.resize(frame, (IMG_SIZE, IMG_SIZE))
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            tensor = rgb.astype(np.float32) / 255.0
+            tensor = np.transpose(tensor, (2, 0, 1))[None, ...]
+
+            output = self.session.run(
+                None, {self.input_name: tensor}
+            )[0]
+
+            if output.shape != (1, 5, 3549):
+                rospy.logerr(
+                    "Unexpected model output shape: %s",
+                    str(output.shape)
+                )
+                return
+
+            predictions = output[0].T
+            boxes = predictions[:, :4]
+            confidences = predictions[:, 4]
+
+            selected = np.where(
+                confidences >= CONF_THRESHOLD
+            )[0]
+
+            scale_x = width / float(IMG_SIZE)
+            scale_y = height / float(IMG_SIZE)
+
+            candidate_boxes = []
+            candidate_scores = []
+
+            for idx in selected:
+                cx, cy, bw, bh = boxes[idx]
+
+                x1 = int((cx - bw / 2) * scale_x)
+                y1 = int((cy - bh / 2) * scale_y)
+                x2 = int((cx + bw / 2) * scale_x)
+                y2 = int((cy + bh / 2) * scale_y)
+
+                x1 = max(0, min(width - 1, x1))
+                y1 = max(0, min(height - 1, y1))
+                x2 = max(0, min(width - 1, x2))
+                y2 = max(0, min(height - 1, y2))
+
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                candidate_boxes.append(
+                    [x1, y1, x2 - x1, y2 - y1]
+                )
+                candidate_scores.append(float(confidences[idx]))
+
+            final_detections = []
+
+            if candidate_boxes:
+                indices = cv2.dnn.NMSBoxes(
+                    candidate_boxes,
+                    candidate_scores,
+                    CONF_THRESHOLD,
+                    NMS_THRESHOLD
+                )
+
+                if len(indices) > 0:
+                    for i in np.array(indices).reshape(-1):
+                        final_detections.append({
+                            "confidence": candidate_scores[int(i)]
+                        })
+
+            if final_detections:
+                self.consecutive_shoe_frames += 1
+
+                rospy.loginfo(
+                    "Frame %d: SHOE DETECTED (%d/%d)",
+                    self.frame_count,
+                    self.consecutive_shoe_frames,
+                    REQUIRED_SHOE_FRAMES
+                )
+
+                if (
+                    self.consecutive_shoe_frames >= REQUIRED_SHOE_FRAMES
+                    and not self.face_mode_triggered
+                ):
+                    self.trigger_face_detection()
+            else:
+                if self.consecutive_shoe_frames > 0:
+                    rospy.loginfo("Shoe lost; resetting counter")
+
+                self.consecutive_shoe_frames = 0
+
+                rospy.loginfo(
+                    "Frame %d (%dx%d): no detections above %.2f",
+                    self.frame_count,
+                    width,
+                    height,
+                    CONF_THRESHOLD
+                )
+
+        except Exception as exc:
+            rospy.logerr("Camera inference error: %s", str(exc))
+
+
+if __name__ == "__main__":
+    try:
+        ShoeCameraTestSingle()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass
